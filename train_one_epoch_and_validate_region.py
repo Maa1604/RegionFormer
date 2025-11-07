@@ -1,13 +1,14 @@
-# train_one_epoch_and_validate.py
-# One-epoch training, validation (loss + perplexity), and CSV with columns: imgid, ref, hyp
+# One-epoch training, validation (loss + perplexity), captions CSV,
+# and ATTENTION HEATMAPS from the Transformer mapper overlaid on images.
 
 import os
 import sys
+import re
 import json
 import math
 import pickle
 import argparse
-from typing import Optional, List
+from typing import Optional, List, Tuple
 
 import pandas as pd
 import numpy as np
@@ -17,19 +18,66 @@ import torch.nn.functional as nnf
 from torch.utils.data import Dataset, DataLoader
 from transformers import GPT2Tokenizer, AdamW, get_linear_schedule_with_warmup
 from tqdm import tqdm
+import matplotlib.pyplot as plt
+from PIL import Image
+
 from RegionFormer.RegionFormer import ClipCaptionModel, ClipCaptionPrefix, MappingType
+from utils.padchest_utils import load_padchest_image, resolve_image_path, ImageResolver
 
 CPU = torch.device("cpu")
+
 
 # ----------------------------
 # Config
 # ----------------------------
-
 def save_config(args: argparse.Namespace):
     cfg = {k: v for k, v in args._get_kwargs()}
     os.makedirs(args.out_dir, exist_ok=True)
     with open(os.path.join(args.out_dir, f"{args.prefix}.json"), "w") as f:
         json.dump(cfg, f, indent=2)
+
+
+# ----------------------------
+# Dataset
+# ----------------------------
+# One-epoch training, validation (loss + perplexity), captions CSV,
+# and ATTENTION HEATMAPS from the Transformer mapper overlaid on images.
+
+import os
+import sys
+import re
+import json
+import math
+import pickle
+import argparse
+from typing import Optional, List, Tuple
+
+import pandas as pd
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.nn.functional as nnf
+from torch.utils.data import Dataset, DataLoader
+from transformers import GPT2Tokenizer, AdamW, get_linear_schedule_with_warmup
+from tqdm import tqdm
+import matplotlib.pyplot as plt
+from PIL import Image
+
+from RegionFormer.RegionFormer import ClipCaptionModel, ClipCaptionPrefix, MappingType
+from utils.padchest_utils import load_padchest_image
+
+CPU = torch.device("cpu")
+
+
+# ----------------------------
+# Config
+# ----------------------------
+def save_config(args: argparse.Namespace):
+    cfg = {k: v for k, v in args._get_kwargs()}
+    os.makedirs(args.out_dir, exist_ok=True)
+    with open(os.path.join(args.out_dir, f"{args.prefix}.json"), "w") as f:
+        json.dump(cfg, f, indent=2)
+
 
 # ----------------------------
 # Dataset
@@ -63,10 +111,18 @@ class ClipCocoDataset(Dataset):
         print(f"Embedding pool size: {len(all_data['clip_embedding'])}")
         sys.stdout.flush()
 
-        self.prefixes = (torch.tensor(all_data["clip_embedding"])
-                         if not torch.is_tensor(all_data["clip_embedding"])
-                         else all_data["clip_embedding"])
+        # SPEEDUP & WARNING FIX: convert list of np arrays -> single np array -> tensor
+        # (keeps dtype; cast to float later if needed)
+        emb = all_data["clip_embedding"]
+        if torch.is_tensor(emb):
+            self.prefixes = emb
+        else:
+            self.prefixes = torch.from_numpy(np.asarray(emb))  # <-- replaces slow torch.tensor(list_of_ndarrays)
+
         captions_raw = all_data["captions"]
+
+        # NEW: keep a string always (empty "" if missing) to avoid None in collate
+        self.base_dir: str = all_data.get("base_dir", "") or ""
 
         # Determine if this PKL actually has mask embeddings
         self.has_mask: bool = len(captions_raw) > 0 and ("clip_mask_embedding" in captions_raw[0])
@@ -78,7 +134,6 @@ class ClipCocoDataset(Dataset):
         self.caption2embedding: List[int] = [c["clip_embedding"] for c in captions_raw]
         self.caption2maskembedding: Optional[List[int]] = None
         if self.has_mask:
-            # could be None / missing for some rows; use -1 as sentinel
             tmp = []
             for c in captions_raw:
                 v = c.get("clip_mask_embedding", None)
@@ -98,11 +153,9 @@ class ClipCocoDataset(Dataset):
             try:
                 with open(token_cache, 'rb') as f:
                     payload = pickle.load(f)
-                # old caches had 3 items; new caches have 4 (include mask mapping)
-                if isinstance(payload, list) and (len(payload) in (3,4)):
+                if isinstance(payload, list) and (len(payload) in (3, 4)):
                     if len(payload) == 3:
                         self.captions_tokens, self.caption2embedding, max_seq_len = payload
-                        # no mask indices in cache; keep what we already built from PKL
                     else:
                         self.captions_tokens, self.caption2embedding, self.caption2maskembedding, max_seq_len = payload
                 else:
@@ -123,7 +176,6 @@ class ClipCocoDataset(Dataset):
             self.captions_tokens.append(torch.tensor(toks, dtype=torch.int64))
             max_seq_len = max(max_seq_len, len(toks))
         os.makedirs(os.path.dirname(token_cache), exist_ok=True) if os.path.dirname(token_cache) else None
-        # Save both mappings when available
         if self.has_mask and self.use_mask:
             with open(token_cache, 'wb') as f:
                 pickle.dump([self.captions_tokens, self.caption2embedding, self.caption2maskembedding, max_seq_len], f)
@@ -146,18 +198,15 @@ class ClipCocoDataset(Dataset):
         mask = tokens.ge(0)
         tokens[~mask] = 0
         mask = mask.float()
-        # prefix mask (prefix_length ones) + token mask
         mask = torch.cat((torch.ones(self.prefix_length), mask), dim=0)
         return tokens, mask
 
     def __getitem__(self, item: int):
         tokens, mask = self.pad_tokens(item)
 
-        # Get image embedding
         idx_img = int(self.caption2embedding[item])
         prefix_img = self.prefixes[idx_img]
 
-        # check if we actually have a valid mask embedding index
         has_valid_mask = (
             self.has_mask and
             (self.caption2maskembedding is not None) and
@@ -170,36 +219,36 @@ class ClipCocoDataset(Dataset):
                 raise RuntimeError("mask_only=True but sample has no mask embedding")
             idx_mask = int(self.caption2maskembedding[item])
             prefix_mask = self.prefixes[idx_mask]
-
             if self.normalize_prefix:
                 prefix_mask = prefix_mask.float()
                 prefix_mask = prefix_mask / (prefix_mask.norm(2, -1) + 1e-8)
-
             prefix = prefix_mask
 
         elif self.use_mask and has_valid_mask:
             idx_mask = int(self.caption2maskembedding[item])
             prefix_mask = self.prefixes[idx_mask]
-
             if self.normalize_prefix:
                 prefix_img = prefix_img.float()
                 prefix_img = prefix_img / (prefix_img.norm(2, -1) + 1e-8)
                 prefix_mask = prefix_mask.float()
                 prefix_mask = prefix_mask / (prefix_mask.norm(2, -1) + 1e-8)
-
             prefix = torch.cat([prefix_img, prefix_mask], dim=-1)
 
         else:
-            # image only
             if self.normalize_prefix:
                 prefix_img = prefix_img.float()
                 prefix_img = prefix_img / (prefix_img.norm(2, -1) + 1e-8)
             prefix = prefix_img
 
-
         image_id = self.image_ids[item]
         ref = self.captions[item]
-        return tokens, mask, prefix, image_id, ref
+
+        # IMPORTANT FIX: return a STRING for base_dir (never None) to satisfy default_collate
+        base_dir_str = self.base_dir  # already "" if missing
+
+        return tokens, mask, prefix, image_id, ref, base_dir_str
+
+
 
 # ----------------------------
 # Text generation (beam / nucleus)
@@ -253,6 +302,7 @@ def generate_beam(model, tokenizer, embed, beam_size: int = 5, entry_length: int
     order = scores.argsort(descending=True)
     return output_texts[order[0]]
 
+
 @torch.no_grad()
 def generate_nucleus(model, tokenizer, embed, entry_length: int = 67, top_p: float = 0.8,
                      temperature: float = 1.0, stop_token: str = ".") -> str:
@@ -283,6 +333,7 @@ def generate_nucleus(model, tokenizer, embed, entry_length: int = 67, top_p: flo
     output_list = list(local_tokens.squeeze().cpu().numpy())
     return GPT2Tokenizer.from_pretrained("gpt2").decode(output_list)
 
+
 # ----------------------------
 # Train one epoch
 # ----------------------------
@@ -297,7 +348,7 @@ def train_one_epoch(dataset: ClipCocoDataset, model: nn.Module, args,
                         num_workers=2, pin_memory=True)
 
     progress = tqdm(total=len(loader), desc="train(epoch)")
-    for tokens, mask, prefix, _, _ in loader:
+    for tokens, mask, prefix, _, _, _ in loader:
         optimizer.zero_grad(set_to_none=True)
         tokens = tokens.to(device)
         mask = mask.to(device)
@@ -314,15 +365,84 @@ def train_one_epoch(dataset: ClipCocoDataset, model: nn.Module, args,
         progress.update(1)
     progress.close()
 
+
 # ----------------------------
-# Validation: loss + CSV
+# Validation helpers: attention -> heatmap
+# ----------------------------
+def _nearest_grid(n: int) -> Tuple[int, int]:
+    """Find a near-square (rows, cols) such that rows*cols == n."""
+    r = int(math.sqrt(n))
+    while r > 0:
+        if n % r == 0:
+            return r, n // r
+        r -= 1
+    return 1, n  # fallback
+
+
+def _sanitize_for_filename(s: str, maxlen: int = 80) -> str:
+    s = s.strip()
+    s = re.sub(r"\s+", "_", s)
+    s = re.sub(r"[^A-Za-z0-9_\-]", "", s)
+    return s[:maxlen] if len(s) > maxlen else s
+
+
+def _attention_to_grid(attn_layers: List[torch.Tensor],
+                       clip_length: int,
+                       prefix_length: int) -> np.ndarray:
+    """
+    attn_layers: list of [B, N, M, H] over concat sequence, same N=M=clip_length+prefix_length
+    Returns [rows, cols] numpy heatmap after:
+      - average over heads H
+      - restrict queries to prefix positions and keys to image positions [0:clip_length]
+      - average over layers and queries
+    """
+    with torch.no_grad():
+        # stack layers -> [L, B, N, M, H]
+        L = len(attn_layers)
+        B, N, M, H = attn_layers[0].shape
+        assert N == M == clip_length + prefix_length
+        # average heads
+        heads_avg = [a.mean(dim=-1) for a in attn_layers]  # each: [B, N, M]
+        # stack layers
+        A = torch.stack(heads_avg, dim=0)  # [L, B, N, M]
+        # select prefix queries and image keys
+        q = slice(clip_length, clip_length + prefix_length)
+        k = slice(0, clip_length)
+        A = A[:, :, q, k]  # [L, B, prefix_len, clip_len]
+        # average over layers and query positions -> [B, clip_len]
+        A = A.mean(dim=(0, 2))  # [B, clip_len]
+        # normalize per-sample to [0,1]
+        A = A - A.min(dim=1, keepdim=True)[0]
+        denom = A.max(dim=1, keepdim=True)[0] + 1e-8
+        A = A / denom
+        heat_1d = A[0].cpu().numpy()  # B=1 during val
+        rows, cols = _nearest_grid(clip_length)
+        heat_2d = heat_1d.reshape(rows, cols)
+        return heat_2d
+
+
+def _overlay_and_save(img: Image.Image, heatmap2d: np.ndarray, out_path: str, title: Optional[str] = None):
+    os.makedirs(os.path.dirname(out_path), exist_ok=True)
+    plt.figure(figsize=(6, 6))
+    plt.imshow(img)  # image background
+    # resize heatmap to image size
+    hm = Image.fromarray((heatmap2d * 255).astype(np.uint8))
+    hm = hm.resize(img.size, resample=Image.BILINEAR)
+    hm_np = np.array(hm) / 255.0
+    plt.imshow(hm_np, alpha=0.35)  # default colormap
+    if title:
+        plt.title(title)
+    plt.axis('off')
+    plt.tight_layout(pad=0)
+    plt.savefig(out_path, dpi=150, bbox_inches='tight', pad_inches=0)
+    plt.close()
+
+
+# ----------------------------
+# Validation: loss + CSV + ATTENTION JPGs
 # ----------------------------
 @torch.no_grad()
 def validate_loss(val_ds: ClipCocoDataset, model: nn.Module) -> float:
-    """
-    Token-level average CE loss with ignore_index=0 (padding).
-    Uses reduction='sum' to get true token-avg over the entire set.
-    """
     device = next(model.parameters()).device
     model.eval()
     loader = DataLoader(val_ds, batch_size=32, shuffle=False, num_workers=2, pin_memory=True)
@@ -330,14 +450,13 @@ def validate_loss(val_ds: ClipCocoDataset, model: nn.Module) -> float:
     total_loss_sum = 0.0
     total_tokens = 0
 
-    for tokens, mask, prefix, _, _ in tqdm(loader, desc="val/loss"):
+    for tokens, mask, prefix, _, _, _ in tqdm(loader, desc="val/loss"):
         tokens = tokens.to(device)
         mask = mask.to(device)
         prefix = prefix.to(device, dtype=torch.float32)
 
         outputs = model(tokens, prefix, mask)
         logits = outputs.logits[:, val_ds.prefix_length - 1: -1]  # align with targets
-        # sum over all non-pad tokens
         loss_sum = nnf.cross_entropy(logits.reshape(-1, logits.shape[-1]),
                                      tokens.flatten(), ignore_index=0, reduction='sum')
         total_loss_sum += loss_sum.item()
@@ -345,6 +464,7 @@ def validate_loss(val_ds: ClipCocoDataset, model: nn.Module) -> float:
 
     avg_loss = total_loss_sum / max(1, total_tokens)
     return avg_loss
+
 
 @torch.no_grad()
 def validate_and_save_csv(val_ds: ClipCocoDataset, model: nn.Module, args) -> str:
@@ -354,10 +474,24 @@ def validate_and_save_csv(val_ds: ClipCocoDataset, model: nn.Module, args) -> st
 
     rows = []
     loader = DataLoader(val_ds, batch_size=1, shuffle=False)
-    for tokens, mask, prefix, image_id, ref in tqdm(loader, desc="val/generate"):
-        prefix = prefix.to(device, dtype=torch.float32)
-        prefix_embed = model.clip_project(prefix).reshape(1, args.prefix_length, -1)
+    attn_dir = os.path.join(args.out_dir, "attn_jpg")
+    os.makedirs(attn_dir, exist_ok=True)
 
+    # [NEW] Build a resolver with user-provided roots + PKL folder as fallback
+    roots = []
+    if args.images_root:
+        roots = [r.strip() for r in args.images_root.split(",") if r.strip()]
+    pkl_dir = os.path.dirname(args.val_pkl)
+    resolver = ImageResolver(roots=roots, extra_try=[pkl_dir, os.getcwd()])
+
+    for tokens, mask, prefix, image_id, ref, base_dir in tqdm(loader, desc="val/generate"):
+        prefix = prefix.to(device, dtype=torch.float32)
+
+        # ---- Project prefix and fetch attentions
+        proj, attns, clip_len = model.project_with_attn(prefix, return_attn=True)
+        prefix_embed = proj.reshape(1, args.prefix_length, -1)
+
+        # ---- Generate text
         if args.beam:
             hyp = generate_beam(model, tokenizer, embed=prefix_embed,
                                 beam_size=args.beam_size, entry_length=args.gen_len,
@@ -366,12 +500,38 @@ def validate_and_save_csv(val_ds: ClipCocoDataset, model: nn.Module, args) -> st
             hyp = generate_nucleus(model, tokenizer, embed=prefix_embed,
                                    entry_length=args.gen_len, top_p=args.top_p,
                                    temperature=args.temp, stop_token=".")
-        rows.append({"imgid": image_id[0], "ref": ref[0], "hyp": hyp})
 
-    os.makedirs(args.out_dir, exist_ok=True)
+        imgid = image_id[0]
+        ref_text = ref[0]
+        hyp_text = hyp
+        rows.append({"imgid": imgid, "ref": ref_text, "hyp": hyp_text})
+
+        # ---- Save attention overlay if attn exists
+        if (attns is not None) and (clip_len is not None) and (len(attns) > 0):
+            try:
+                heat2d = _attention_to_grid(attns, clip_length=clip_len, prefix_length=args.prefix_length)
+
+                # [NEW] robust resolution of the actual image file:
+                base_dir_str = base_dir[0] if isinstance(base_dir, (list, tuple)) else base_dir
+                img_path = resolver.resolve(imgid, base_dir=base_dir_str, pkl_dir=pkl_dir)
+                if not img_path:
+                    raise FileNotFoundError(f"Could not resolve image path for {imgid}")
+
+                img = load_padchest_image(img_path)  # accepts resolved absolute/relative string
+
+                fname = f"{_sanitize_for_filename(os.path.basename(img_path))}_" \
+                        f"{_sanitize_for_filename(ref_text)}_{_sanitize_for_filename(hyp_text)}.jpg"
+                out_path = os.path.join(attn_dir, fname)
+                _overlay_and_save(img, heat2d, out_path)
+            except Exception as e:
+                print(f"[warn] attention viz failed for {imgid}: {e}")
+                sys.stdout.flush()
+
     csv_path = os.path.join(args.out_dir, f"{args.prefix}_val_captions.csv")
     pd.DataFrame(rows, columns=["imgid", "ref", "hyp"]).to_csv(csv_path, index=False)
     return csv_path
+
+
 
 # ----------------------------
 # Orchestration
@@ -379,12 +539,10 @@ def validate_and_save_csv(val_ds: ClipCocoDataset, model: nn.Module, args) -> st
 def build_model(args):
     # Base CLIP embedding size (ViT/RN)
     base_dim = 640 if args.is_rn else 512
-    
+
     if args.use_mask and not args.mask_only:
-        # concatenation [img || mask]
-        prefix_dim = base_dim * 2
+        prefix_dim = base_dim * 2  # concatenation [img || mask]
     else:
-        # either mask_only or image_only
         prefix_dim = base_dim
 
     map_type = {'mlp': MappingType.MLP, 'transformer': MappingType.Transformer}[args.mapping_type]
@@ -402,8 +560,9 @@ def build_model(args):
                                  mapping_type=map_type)
     return model.to(torch.device('cuda:0' if torch.cuda.is_available() else 'cpu'))
 
+
 def parse_args():
-    p = argparse.ArgumentParser(description="One-epoch training + validation (loss & CSV)")
+    p = argparse.ArgumentParser(description="One-epoch training + validation (loss & CSV & attention JPGs)")
     # Data
     p.add_argument('--train_pkl', type=str, required=True)
     p.add_argument('--val_pkl',   type=str, required=True)
@@ -434,7 +593,12 @@ def parse_args():
     p.add_argument('--top_p', type=float, default=0.8)
     p.add_argument('--temp', type=float, default=1.0)
 
+    # [NEW] image roots for attention overlays (comma-separated)
+    p.add_argument('--images_root', type=str, default="",
+                   help="Comma-separated directories to search for images if paths in PKL are relative or missing.")
+
     return p.parse_args()
+
 
 def main():
     args = parse_args()
@@ -444,7 +608,7 @@ def main():
 
     save_config(args)
 
-    # Datasets (pass use_mask to control concatenation behavior)
+    # Datasets
     train_ds = ClipCocoDataset(args.train_pkl, args.prefix_length,
                                normalize_prefix=args.normalize_prefix, use_mask=args.use_mask, mask_only=args.mask_only)
     val_ds   = ClipCocoDataset(args.val_pkl, args.prefix_length,
@@ -456,7 +620,6 @@ def main():
     # Optimizer & scheduler created ONCE for all epochs
     optimizer = AdamW(model.parameters(), lr=args.lr)
 
-    # steps per epoch (drop_last=True like in the DataLoader inside train_one_epoch)
     steps_per_epoch = len(train_ds) // args.bs
     total_train_steps = max(1, steps_per_epoch * args.epochs)
     scheduler = get_linear_schedule_with_warmup(
@@ -477,7 +640,7 @@ def main():
         torch.save(model.state_dict(), ckpt_path)
         print(f"Saved checkpoint: {ckpt_path}")
 
-        # Validation each epoch
+        # Validation loss
         print(">>> Computing validation loss")
         val_loss = validate_loss(val_ds, model)
         val_ppl = math.exp(min(50, val_loss))
@@ -496,12 +659,13 @@ def main():
             json.dump({"epoch": epoch, "val_loss": val_loss, "val_ppl": val_ppl}, f, indent=2)
         print(f"Wrote metrics: {metrics_path}")
 
-    # (Optional) Generate CSV once at the end with the best model
-    print(">>> Loading best checkpoint and generating validation captions CSV")
+    # Generate CSV + attention JPGs using best model
+    print(">>> Loading best checkpoint and generating validation captions & attention images")
     model.load_state_dict(torch.load(os.path.join(args.out_dir, f"{args.prefix}-best.pt"),
                                      map_location=next(model.parameters()).device))
     csv_path = validate_and_save_csv(val_ds, model, args)
     print(f"Wrote CSV: {csv_path}")
+
 
 if __name__ == "__main__":
     main()
