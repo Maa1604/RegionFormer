@@ -421,21 +421,34 @@ def _attention_to_grid(attn_layers: List[torch.Tensor],
         return heat_2d
 
 
-def _overlay_and_save(img: Image.Image, heatmap2d: np.ndarray, out_path: str, title: Optional[str] = None):
+import matplotlib.cm as cm
+from PIL import Image
+
+def _overlay_and_save(xray_arr: np.ndarray, heatmap2d: np.ndarray, out_path: str,
+                      alpha: float = 0.35, cmap_name: str = "jet"):
+    """
+    Blend the attention heatmap with the 16-bit PadChest X-ray correctly.
+    - xray_arr: float32 array [0,1], grayscale X-ray.
+    - heatmap2d: float32 array [0,1], attention map (already resized if needed).
+    - alpha: transparency of the heatmap (0–1).
+    """
     os.makedirs(os.path.dirname(out_path), exist_ok=True)
-    plt.figure(figsize=(6, 6))
-    plt.imshow(img)  # image background
-    # resize heatmap to image size
-    hm = Image.fromarray((heatmap2d * 255).astype(np.uint8))
-    hm = hm.resize(img.size, resample=Image.BILINEAR)
-    hm_np = np.array(hm) / 255.0
-    plt.imshow(hm_np, alpha=0.35)  # default colormap
-    if title:
-        plt.title(title)
-    plt.axis('off')
-    plt.tight_layout(pad=0)
-    plt.savefig(out_path, dpi=150, bbox_inches='tight', pad_inches=0)
-    plt.close()
+
+    H, W = xray_arr.shape
+    # --- prepare grayscale to RGB ---
+    base_rgb = np.stack([xray_arr, xray_arr, xray_arr], axis=-1)  # (H,W,3)
+
+    # --- prepare color heatmap ---
+    heatmap_img = Image.fromarray((heatmap2d * 255).astype(np.uint8)).resize((W, H), Image.BILINEAR)
+    hm_np = np.asarray(heatmap_img, dtype=np.float32) / 255.0
+    heat_rgb = cm.get_cmap(cmap_name)(hm_np)[..., :3]
+
+    # --- blend ---
+    alpha = float(np.clip(alpha, 0.0, 1.0))
+    blend = (1.0 - alpha) * base_rgb + alpha * heat_rgb
+    blend = (np.clip(blend, 0.0, 1.0) * 255).astype(np.uint8)
+
+    Image.fromarray(blend).save(out_path, quality=95, subsampling=0)
 
 
 # ----------------------------
@@ -517,12 +530,12 @@ def validate_and_save_csv(val_ds: ClipCocoDataset, model: nn.Module, args) -> st
                 if not img_path:
                     raise FileNotFoundError(f"Could not resolve image path for {imgid}")
 
-                img = load_padchest_image(img_path)  # accepts resolved absolute/relative string
-
+                xray_arr = load_padchest_image(img_path)
                 fname = f"{_sanitize_for_filename(os.path.basename(img_path))}_" \
                         f"{_sanitize_for_filename(ref_text)}_{_sanitize_for_filename(hyp_text)}.jpg"
                 out_path = os.path.join(attn_dir, fname)
-                _overlay_and_save(img, heat2d, out_path)
+                _overlay_and_save(xray_arr, heat2d, out_path, alpha=getattr(args, "overlay_alpha", 0.35))
+
             except Exception as e:
                 print(f"[warn] attention viz failed for {imgid}: {e}")
                 sys.stdout.flush()

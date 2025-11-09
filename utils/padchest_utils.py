@@ -99,18 +99,30 @@ class ImageResolver:
         return hit
 
 
-def load_padchest_image(image_path_or_id: Any, base_dir: Optional[Any] = None) -> Image.Image:
+import os
+import numpy as np
+from PIL import Image
+import matplotlib.pyplot as plt
+
+def load_padchest_image(image_path: str) -> np.ndarray:
     """
-    Loads an image path (already resolved or not) and returns a PIL RGB image.
-    Accepts strings, tuples, lists, dicts.
+    Loads PadChest 16-bit grayscale PNG correctly and returns a float32 array in [0,1].
+    Works for both 8-bit and 16-bit images.
     """
-    p = image_path_or_id
-    if not isinstance(p, str) or not os.path.isfile(p):
-        p = resolve_image_path(image_path_or_id, base_dir)
-    if not p or not os.path.isfile(p):
-        raise FileNotFoundError(p)
-    img = Image.open(p)
-    img = ImageOps.exif_transpose(img)
-    if img.mode != "RGB":
-        img = img.convert("RGB")
-    return img
+    if not os.path.isfile(image_path):
+        raise FileNotFoundError(f"Image not found: {image_path}")
+
+    img = Image.open(image_path)
+    arr = np.array(img)
+
+    # --- normalize depending on dtype ---
+    if arr.dtype == np.uint16:
+        arr = arr.astype(np.float32)
+        arr = (arr - arr.min()) / (arr.max() - arr.min() + 1e-8)
+    elif arr.dtype == np.uint8:
+        arr = arr.astype(np.float32) / 255.0
+    else:
+        arr = arr.astype(np.float32)
+        arr = (arr - arr.min()) / (arr.max() - arr.min() + 1e-8)
+
+    return arr  # shape (H,W), float32 [0,1]

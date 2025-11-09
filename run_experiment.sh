@@ -10,7 +10,7 @@ IMAGES_ROOT=/home/moha/Desktop/CLIP_prefix_caption/data/padchestgr/PadChest_GR
 # Run WITHOUT mask
 # ============================================================
 
-OUT_DIR=./EXPERIMENTS/padchestgr_train_tf_prefix_jpg_region_15_without_mask_img/
+OUT_DIR=./EXPERIMENTS/padchestgr_train_tf_prefix_jpg_region_15_without_mask_img_cr/
 
 echo "Running experiment WITHOUT mask..."
 python train_one_epoch_and_validate_region.py \
@@ -34,7 +34,7 @@ python train_one_epoch_and_validate_region.py \
 # Run WITH mask
 # ============================================================
 
-OUT_DIR=./EXPERIMENTS/padchestgr_train_tf_prefix_jpg_region_15_with_mask_img/
+OUT_DIR=./EXPERIMENTS/padchestgr_train_tf_prefix_jpg_region_15_with_mask_img_cr/
 
 echo "Running experiment WITH mask..."
 python train_one_epoch_and_validate_region.py \

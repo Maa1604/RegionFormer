@@ -2,3 +2,4 @@ __pycache__/
 EXPERIMENTS
 data
 bertscore_simple.py
+comparison
