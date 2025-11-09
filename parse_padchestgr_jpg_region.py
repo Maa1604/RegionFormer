@@ -18,20 +18,28 @@ import clip  # installed via the repo's environment.yml
 # -------------------------------
 def load_padchest_image(path: str) -> Image.Image:
     """
-    Loads a PadChest image, applies percentile-based normalization,
+    Loads a PadChest image (8-bit or 16-bit), applies percentile-based normalization,
     and returns it as an RGB PIL Image.
     """
-    img = Image.open(path).convert("L")  # Ensure grayscale
-    arr = np.array(img, dtype=np.float32)
+    # --- Load image correctly (supports 16-bit PNGs) ---
+    img = Image.open(path)
+    arr = np.array(img)
 
-    # Normalize by 99th percentile to handle bright outliers
+    # Convert 16-bit to float in [0, 1]
+    if arr.dtype == np.uint16:
+        arr = arr.astype(np.float32)
+        arr = (arr - arr.min()) / (arr.max() - arr.min() + 1e-8)
+    else:
+        # For 8-bit or other dtypes, convert to float [0, 1]
+        arr = arr.astype(np.float32)
+        arr = arr / 255.0
+
+    # --- Percentile normalization (99th percentile) ---
     p99 = np.percentile(arr, 99)
     arr = np.clip(arr / (p99 + 1e-8), 0, 1)
 
-    # Convert back to 8-bit image
+    # --- Convert back to 8-bit and RGB ---
     arr8 = (arr * 255).astype(np.uint8)
-
-    # Stack into 3 channels (RGB)
     rgb = np.stack([arr8] * 3, axis=-1)
 
     return Image.fromarray(rgb)
