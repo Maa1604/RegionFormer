@@ -1,12 +1,14 @@
-name: clip_prefix_caption
+name: regionformer
 channels:
   - defaults
 dependencies:
 - python>=3.8
 - pip>=21
 - scikit-image=0.18.1
+- pandas
 - pip:
    - transformers~=4.10.2
+   - huggingface_hub==0.0.12
    - ftfy
    - regex
    - tqdm
