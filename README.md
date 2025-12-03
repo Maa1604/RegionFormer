@@ -11,7 +11,7 @@ This repository contains the **official implementation** of the paper:
 
 Below is the architecture diagram used in the paper:
 
-[Image of the RegionFormer model architecture diagram]
+![Model](model.png)
 
 -----
 
